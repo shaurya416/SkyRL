@@ -363,3 +363,96 @@ class TestConcurrentREPLOutput:
         assert results["b"].stdout == "b1\n"
         # Output written outside any REPL execution still reaches the process stream.
         assert process_stdout.getvalue() == "outside\n"
+
+
+# ---------------------------------------------------------------------------
+# 5. Timed-out executions (thread fallback)
+# ---------------------------------------------------------------------------
+
+
+def _execute_off_main_thread(repl, code):
+    """Run ``repl.execute`` on a worker thread, as env steps do, so the thread-timeout path is used."""
+    import threading
+
+    results = {}
+    thread = threading.Thread(target=lambda: results.__setitem__("r", repl.execute(code)))
+    thread.start()
+    thread.join(10)
+    return results["r"]
+
+
+def _execute_timing_out(repl, code):
+    """Execute code that times out; returns the result and the abandoned thread still running it."""
+    import threading
+
+    before = set(threading.enumerate())
+    result = _execute_off_main_thread(repl, code)
+    abandoned = [t for t in threading.enumerate() if t not in before and t.is_alive()]
+    assert "Timeout" in result.stderr
+    assert len(abandoned) == 1
+    return result, abandoned[0]
+
+
+class TestTimedOutExecution:
+    """A timed-out execution keeps running on its abandoned thread; nothing it does may reach later turns."""
+
+    def _repl(self, **extra_tools):
+        import threading
+
+        release = threading.Event()
+        tools = {"block": lambda: release.wait(5), **extra_tools}
+        return PersistentREPL(timeout=0.5, custom_tools=tools), release
+
+    def test_thread_path_commits_variables_and_final_answer(self):
+        repl, _ = self._repl()
+        result = _execute_off_main_thread(repl, "x = 3\nFINAL_VAR('x')")
+        assert result.stderr == ""
+        assert result.final_answer == "3"
+        assert repl.locals["x"] == 3
+
+    def test_final_var_before_timeout_is_reported(self):
+        repl, release = self._repl()
+        result, abandoned = _execute_timing_out(repl, "x = 1\nFINAL_VAR('x')\nblock()")
+        release.set()
+        abandoned.join(5)
+        assert result.final_answer == "1"
+
+    def test_error_while_persisting_variables_is_not_reported_as_timeout(self):
+        repl, _ = self._repl()
+        # A non-string key in the namespace makes persisting the variables raise.
+        result = _execute_off_main_thread(repl, "vars()[1] = 2")
+        assert "Timeout" not in result.stderr
+        assert "Traceback" in result.stderr
+
+    def test_late_assignment_does_not_overwrite_newer_value(self):
+        repl, release = self._repl()
+        _, abandoned = _execute_timing_out(repl, "block()\nanswer = 'stale'")
+        _execute_off_main_thread(repl, "answer = 'fresh'")
+        release.set()
+        abandoned.join(5)
+
+        result = _execute_off_main_thread(repl, "FINAL_VAR('answer')")
+        assert result.final_answer == "fresh"
+
+    def test_late_final_var_is_not_reported_by_next_execution(self):
+        repl, release = self._repl()
+        timed_out, abandoned = _execute_timing_out(repl, "block()\nguess = 'late'\nFINAL_VAR('guess')")
+        assert timed_out.final_answer is None
+        release.set()
+        abandoned.join(5)
+
+        result = _execute_off_main_thread(repl, "x = 1")
+        assert result.final_answer is None
+
+    def test_late_finish_does_not_hide_variables_of_running_execution(self):
+        abandoned_threads = []
+        repl, release = self._repl(
+            finish_timed_out_turn=lambda: (release.set(), abandoned_threads[0].join(5)),
+        )
+        _, abandoned = _execute_timing_out(repl, "block()")
+        abandoned_threads.append(abandoned)
+
+        # The timed-out turn completes while this one is between assigning y and reading it back.
+        result = _execute_off_main_thread(repl, "y = 5\nfinish_timed_out_turn()\nFINAL_VAR('y')")
+        assert not abandoned.is_alive()
+        assert result.final_answer == "5"

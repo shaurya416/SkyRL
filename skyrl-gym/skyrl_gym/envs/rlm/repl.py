@@ -8,7 +8,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -236,9 +236,12 @@ class PersistentREPL:
             "__name__": "__main__",
         }
         self.locals: Dict[str, Any] = {}
-        self._last_final_answer: Optional[str] = None
+        # Per-execution state, kept per thread: the live combined dict while code
+        # runs and the record its FINAL_VAR answer goes to. A timed-out execution
+        # keeps running on its own thread, so shared fields would let it read and
+        # overwrite the state of the executions that follow it.
+        self._exec_state = threading.local()
 
-        self._exec_combined: Optional[Dict[str, Any]] = None  # live combined dict during exec
         self.globals["FINAL_VAR"] = self._final_var
         self.globals["SHOW_VARS"] = self._show_vars
 
@@ -291,14 +294,13 @@ class PersistentREPL:
         """Return the value of a variable as the final answer, or stringify a direct value."""
         if not isinstance(variable_name, str):
             answer = str(variable_name)
-            self._last_final_answer = answer
+            self._record_final_answer(answer)
             return answer
         variable_name = variable_name.strip().strip("\"'")
-        # Look in the live combined dict first (set during exec), then fall back to self.locals
-        lookup = self._exec_combined if self._exec_combined is not None else self.locals
+        lookup = self._live_namespace()
         if variable_name in lookup:
             answer = str(lookup[variable_name])
-            self._last_final_answer = answer
+            self._record_final_answer(answer)
             return answer
         available = [k for k in lookup if not k.startswith("_") and k not in self.globals]
         if available:
@@ -316,9 +318,20 @@ class PersistentREPL:
         print(msg)
         return msg
 
+    def _record_final_answer(self, answer: str) -> None:
+        """Store a FINAL_VAR answer on the record of the execution running on this thread."""
+        record = getattr(self._exec_state, "record", None)
+        if record is not None:
+            record["final_answer"] = answer
+
+    def _live_namespace(self) -> Dict[str, Any]:
+        """The live combined dict of the execution on this thread, else the persisted locals."""
+        namespace = getattr(self._exec_state, "namespace", None)
+        return self.locals if namespace is None else namespace
+
     def _show_vars(self) -> str:
         """Show all user-created variables in the REPL."""
-        lookup = self._exec_combined if self._exec_combined is not None else self.locals
+        lookup = self._live_namespace()
         available = {k: type(v).__name__ for k, v in lookup.items() if not k.startswith("_") and k not in self.globals}
         if not available:
             return "No variables created yet. Use ```repl``` blocks to create variables."
@@ -450,15 +463,11 @@ class PersistentREPL:
         # logic on spawned threads — must use the thread fallback.
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
-        error_str: Optional[str] = None
 
         if _can_use_sigalrm():
-            error_str = self._execute_with_sigalrm(code, stdout_buf, stderr_buf)
+            error_str, final_answer = self._execute_with_sigalrm(code, stdout_buf, stderr_buf)
         else:
-            error_str = self._execute_with_thread_timeout(code, stdout_buf, stderr_buf)
-
-        final_answer = self._last_final_answer
-        self._last_final_answer = None
+            error_str, final_answer = self._execute_with_thread_timeout(code, stdout_buf, stderr_buf)
 
         return REPLResult(
             stdout=stdout_buf.getvalue(),
@@ -467,62 +476,98 @@ class PersistentREPL:
             final_answer=final_answer,
         )
 
-    def _execute_with_sigalrm(self, code: str, stdout_buf: io.StringIO, stderr_buf: io.StringIO) -> Optional[str]:
+    def _begin_exec(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the combined dict for one execution and bind it to the calling thread.
+
+        FINAL_VAR calls made by this execution store their answer in ``record["final_answer"]``.
+        """
+        combined = {**self.globals, **self.locals}
+        self._exec_state.namespace = combined
+        self._exec_state.record = record
+        return combined
+
+    def _end_exec(self) -> None:
+        """Unbind the calling thread's combined dict and record."""
+        self._exec_state.namespace = None
+        self._exec_state.record = None
+
+    def _commit(self, combined: Dict[str, Any]) -> None:
+        """Persist the variables an execution created, then restore the scaffold."""
+        for key, value in combined.items():
+            if key not in self.globals and not key.startswith("_"):
+                self.locals[key] = value
+        self._restore_scaffold()
+
+    def _execute_with_sigalrm(
+        self, code: str, stdout_buf: io.StringIO, stderr_buf: io.StringIO
+    ) -> Tuple[Optional[str], Optional[str]]:
         def _raise_timeout(*_):
             raise TimeoutError("Code execution timed out")
 
         old_alarm = None
+        error_str: Optional[str] = None
+        record: Dict[str, Any] = {"final_answer": None}
         try:
             old_alarm = signal.signal(signal.SIGALRM, _raise_timeout)
             signal.alarm(int(self.timeout))
             with _capture_output(stdout_buf, stderr_buf):
-                combined = {**self.globals, **self.locals}
-                self._exec_combined = combined
+                combined = self._begin_exec(record)
                 exec(code, combined, combined)
-                self._exec_combined = None
-                for key, value in combined.items():
-                    if key not in self.globals and not key.startswith("_"):
-                        self.locals[key] = value
-                self._restore_scaffold()
+                self._commit(combined)
         except TimeoutError:
-            self._exec_combined = None
-            return f"Timeout after {int(self.timeout)} seconds\n"
+            error_str = f"Timeout after {int(self.timeout)} seconds\n"
         except Exception:
-            self._exec_combined = None
-            return traceback.format_exc()
+            error_str = traceback.format_exc()
         finally:
             signal.alarm(0)
             if old_alarm is not None:
                 signal.signal(signal.SIGALRM, old_alarm)
-        return None
+            self._end_exec()
+        return error_str, record["final_answer"]
 
     def _execute_with_thread_timeout(
         self, code: str, stdout_buf: io.StringIO, stderr_buf: io.StringIO
-    ) -> Optional[str]:
-        """Fallback when SIGALRM is unavailable (e.g. non-main thread in Ray workers)."""
-        result: dict = {"error": None}
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Fallback when SIGALRM is unavailable (e.g. non-main thread in Ray workers).
+
+        A timed-out thread cannot be stopped, so its execution is abandoned:
+        whatever it does after the timeout (variables it assigns, a FINAL_VAR
+        answer) is discarded rather than landing in a later execution. A FINAL_VAR
+        answer recorded before the timeout is still reported, as on the SIGALRM path.
+        """
+        result: dict = {"error": None, "final_answer": None, "finished": False, "abandoned": False}
+        lock = threading.Lock()
 
         def _run():
+            combined: Optional[Dict[str, Any]] = None
+            error: Optional[str] = None
             try:
                 with _capture_output(stdout_buf, stderr_buf):
-                    combined = {**self.globals, **self.locals}
-                    self._exec_combined = combined
+                    combined = self._begin_exec(result)
                     exec(code, combined, combined)
-                    self._exec_combined = None
-                    for key, value in combined.items():
-                        if key not in self.globals and not key.startswith("_"):
-                            self.locals[key] = value
-                    self._restore_scaffold()
             except Exception:
-                self._exec_combined = None
-                result["error"] = traceback.format_exc()
+                combined = None
+                error = traceback.format_exc()
+            finally:
+                self._end_exec()
+            with lock:
+                if result["abandoned"]:
+                    return
+                if combined is not None:
+                    try:
+                        self._commit(combined)
+                    except Exception:
+                        error = traceback.format_exc()
+                result.update(error=error, finished=True)
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         t.join(timeout=self.timeout)
-        if t.is_alive():
-            return f"Timeout after {int(self.timeout)} seconds\n"
-        return result["error"]
+        with lock:
+            if not result["finished"]:
+                result["abandoned"] = True
+                return f"Timeout after {int(self.timeout)} seconds\n", result["final_answer"]
+        return result["error"], result["final_answer"]
 
     # ------------------------------------------------------------------
     # Validation helpers

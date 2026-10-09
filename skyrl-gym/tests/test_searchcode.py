@@ -45,6 +45,16 @@ def test_tool_parsing(action, expected_tool_name, expected_tool_input):
             "<tool><python>raise ValueError('fail')</python></tool>",
             'Error executing Python code: Traceback (most recent call last):\n  File "<string>", line 1, in <module>\nValueError: fail',
         ),
+        # A failing exit status is an error even when nothing was written to stderr.
+        (
+            "<tool><python>import sys; print('partial'); sys.exit(3)</python></tool>",
+            "Error executing Python code: Process exited with status 3 and no error output.",
+        ),
+        # A successful run that also writes to stderr (e.g. a warning) keeps its stdout.
+        (
+            "<tool><python>import sys; print(42); print('note', file=sys.stderr)</python></tool>",
+            "42\nnote",
+        ),
     ],
 )
 def test_python_code_execution(action, expected_output):

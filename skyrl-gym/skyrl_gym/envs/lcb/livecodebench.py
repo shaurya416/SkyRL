@@ -220,6 +220,30 @@ def get_stripped_lines(val: str):
     return [val_line.strip() for val_line in val.split("\n")]
 
 
+_PLAIN_SCALAR_TYPES = (type(None), bool, int, float, str)
+
+
+def is_plain_data(value) -> bool:
+    """True if ``value`` is built only from the JSON-like builtins the expected outputs use.
+
+    The graded code can return an object of its own class whose ``__eq__`` accepts
+    anything (directly, or nested inside a list), which would pass every
+    ``prediction == expected`` check. Exact type checks keep the comparison on
+    builtin equality. Types are matched with ``is``: ``in`` and ``==`` on a class
+    defer to its metaclass, which the graded code can also define. numpy's own
+    scalar types (the items of ``list(np.array(...))``) are immutable and allowed.
+    """
+    value_type = type(value)
+    if any(value_type is t for t in _PLAIN_SCALAR_TYPES):
+        return True
+    if value_type is list or value_type is tuple:
+        return all(is_plain_data(item) for item in value)
+    if value_type is dict:
+        return all(is_plain_data(key) and is_plain_data(item) for key, item in value.items())
+    numpy = sys.modules.get("numpy")
+    return numpy is not None and any(value_type is t for t in numpy.sctypeDict.values())
+
+
 def grade_call_based(code: str, all_inputs: list, all_outputs: list, fn_name: str, timeout: int):
     # call-based clean up logic
     # need to wrap in try-catch logic after to catch the correct errors, but for now this is fine.
@@ -255,7 +279,7 @@ def grade_call_based(code: str, all_inputs: list, all_outputs: list, fn_name: st
             if isinstance(prediction, tuple):
                 prediction = list(prediction)
 
-            tmp_result = prediction == gt_out
+            tmp_result = is_plain_data(prediction) and prediction == gt_out
 
             # handle floating point comparisons
 
