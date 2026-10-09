@@ -1,11 +1,12 @@
 import io
 import shutil
 import signal
+import sys
 import tempfile
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -132,6 +133,70 @@ class REPLResult:
 def _can_use_sigalrm() -> bool:
     """SIGALRM is only usable from the main thread on Unix."""
     return hasattr(signal, "SIGALRM") and threading.current_thread() is threading.main_thread()
+
+
+# ---------------------------------------------------------------------------
+# Per-thread output capture
+# ---------------------------------------------------------------------------
+
+
+class _ThreadRoutedStream:
+    """Stand-in for ``sys.stdout`` / ``sys.stderr`` that routes writes per thread.
+
+    ``contextlib.redirect_stdout`` swaps the process-wide stream, so REPLs
+    executing concurrently (env steps run on a thread pool) capture each
+    other's output and can leave ``sys.stdout`` bound to a finished buffer.
+    Here each executing thread registers its own buffer; threads without one
+    write to the stream this object replaced.
+    """
+
+    def __init__(self, fallback):
+        self._fallback = fallback
+        self._local = threading.local()
+
+    def _target(self):
+        target = getattr(self._local, "target", None)
+        return self._fallback if target is None else target
+
+    def redirect(self, target):
+        """Route the calling thread's writes to ``target``; returns the previous target."""
+        previous = getattr(self._local, "target", None)
+        self._local.target = target
+        return previous
+
+    def write(self, s):
+        return self._target().write(s)
+
+    def flush(self):
+        return self._target().flush()
+
+    def __getattr__(self, name):
+        return getattr(self._target(), name)
+
+
+_STREAM_ROUTER_LOCK = threading.Lock()
+
+
+def _stream_router(name: str) -> _ThreadRoutedStream:
+    """Return the router installed as ``sys.<name>``, installing one if needed."""
+    with _STREAM_ROUTER_LOCK:
+        stream = getattr(sys, name)
+        if not isinstance(stream, _ThreadRoutedStream):
+            stream = _ThreadRoutedStream(stream)
+            setattr(sys, name, stream)
+        return stream
+
+
+@contextmanager
+def _capture_output(stdout_buf: io.StringIO, stderr_buf: io.StringIO):
+    """Send the calling thread's stdout/stderr to the given buffers for the block."""
+    routes = [(_stream_router("stdout"), stdout_buf), (_stream_router("stderr"), stderr_buf)]
+    previous = [router.redirect(buf) for router, buf in routes]
+    try:
+        yield
+    finally:
+        for (router, _), prev in zip(routes, previous):
+            router.redirect(prev)
 
 
 class PersistentREPL:
@@ -410,7 +475,7 @@ class PersistentREPL:
         try:
             old_alarm = signal.signal(signal.SIGALRM, _raise_timeout)
             signal.alarm(int(self.timeout))
-            with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            with _capture_output(stdout_buf, stderr_buf):
                 combined = {**self.globals, **self.locals}
                 self._exec_combined = combined
                 exec(code, combined, combined)
@@ -439,7 +504,7 @@ class PersistentREPL:
 
         def _run():
             try:
-                with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+                with _capture_output(stdout_buf, stderr_buf):
                     combined = {**self.globals, **self.locals}
                     self._exec_combined = combined
                     exec(code, combined, combined)

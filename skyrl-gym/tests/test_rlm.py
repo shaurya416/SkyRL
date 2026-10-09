@@ -280,3 +280,86 @@ class TestRLMEnvWithLMCallback:
         step_out = env.step(action)
         obs_text = " ".join(o["content"] for o in step_out["observations"])
         assert "NameError" in obs_text or "name 'llm_query' is not defined" in obs_text
+
+    def test_final_answer_without_repl_block_ends_episode(self):
+        """FINAL(...) given as plain text, with no repl block, is the final answer."""
+        env = self._make_env()
+        env.init([{"role": "user", "content": "What is the capital of France?"}])
+
+        step_out = env.step("The context says it plainly.\nFINAL(Paris)")
+        assert step_out["done"] is True
+        assert step_out["observations"] == []
+        assert env.get_metrics()["final_answer"] == "Paris"
+
+    def test_final_var_in_separate_response_ends_episode(self):
+        """The system prompt's instructed flow: assign in a repl block, then FINAL_VAR in a separate response."""
+        env = self._make_env()
+        env.init([{"role": "user", "content": "What is the capital of France?"}])
+
+        step_out = env.step("```repl\nanswer = 'Paris'\nprint(answer)\n```")
+        assert step_out["done"] is False
+
+        step_out = env.step("The variable holds the answer.\nFINAL_VAR(answer)")
+        assert step_out["done"] is True
+        assert step_out["reward"] == 1.0
+        assert env.get_metrics()["final_answer"] == "Paris"
+
+    def test_no_repl_block_and_no_final_answer_still_prompts_for_code(self):
+        env = self._make_env()
+        env.init([{"role": "user", "content": "question"}])
+
+        step_out = env.step("I am thinking about it.")
+        assert step_out["done"] is False
+        assert "No ```repl``` code block found" in step_out["observations"][0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Concurrent execution
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentREPLOutput:
+    def test_concurrent_executions_capture_only_their_own_output(self):
+        """Env steps run on a thread pool; one REPL's prints must not land in another's result."""
+        import io
+        import sys
+        import threading
+
+        a_started, b_started, a_finished = threading.Event(), threading.Event(), threading.Event()
+        tools = {
+            "a_started": a_started.set,
+            "wait_for_b": lambda: b_started.wait(5),
+            "a_finished": a_finished.set,
+            "b_started": b_started.set,
+            "wait_for_a": lambda: a_finished.wait(5),
+        }
+        repl_a = PersistentREPL(custom_tools=tools)
+        repl_b = PersistentREPL(custom_tools=tools)
+        results = {}
+
+        process_stdout = io.StringIO()
+        saved_stdout = sys.stdout
+        sys.stdout = process_stdout
+        try:
+            # A is mid-execution when B starts, and A keeps printing while B is running.
+            thread_a = threading.Thread(
+                target=lambda: results.__setitem__(
+                    "a", repl_a.execute("print('a1')\na_started()\nwait_for_b()\nprint('a2')\na_finished()")
+                )
+            )
+            thread_a.start()
+            assert a_started.wait(5)
+            thread_b = threading.Thread(
+                target=lambda: results.__setitem__("b", repl_b.execute("b_started()\nwait_for_a()\nprint('b1')"))
+            )
+            thread_b.start()
+            thread_a.join(10)
+            thread_b.join(10)
+            print("outside")
+        finally:
+            sys.stdout = saved_stdout
+
+        assert results["a"].stdout == "a1\na2\n"
+        assert results["b"].stdout == "b1\n"
+        # Output written outside any REPL execution still reaches the process stream.
+        assert process_stdout.getvalue() == "outside\n"

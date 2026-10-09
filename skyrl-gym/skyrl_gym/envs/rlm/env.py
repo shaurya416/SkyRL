@@ -349,6 +349,12 @@ class BaseRLMEnv(BaseTextEnv):
 
         # Branch 1: model didn't produce a repl block.
         if code is None:
+            # The response may still carry the final answer, as the system prompt
+            # instructs: FINAL(...) as text, or FINAL_VAR(...) naming a variable
+            # assigned in an earlier turn.
+            final_answer = _find_final_answer(action, self.repl)
+            if final_answer is not None:
+                return self._finish(final_answer)
             obs_text = "[No ```repl``` code block found. Wrap your code in ```repl\\n...\\n``` blocks.]"
             return self._make_step_output([{"role": "user", "content": obs_text}], done=done)
 
@@ -358,9 +364,7 @@ class BaseRLMEnv(BaseTextEnv):
         # Two-stage final answer detection: FINAL_VAR() inside exec, or text-parsed FINAL/FINAL_VAR.
         final_answer = result.final_answer or _find_final_answer(action, self.repl)
         if final_answer is not None:
-            self._final_answer = final_answer
-            self._reward = self._get_reward(final_answer)
-            return self._make_step_output([], done=True)
+            return self._finish(final_answer)
 
         # Hit max_turns without an answer: terminate with reward 0 (the default _reward).
         if done:
@@ -373,6 +377,12 @@ class BaseRLMEnv(BaseTextEnv):
             result_str = result_str[:_MAX_RESULT_LEN] + f"... + [{len(result_str) - _MAX_RESULT_LEN} chars...]"
         obs_text = f"Code executed:\n```python\n{code}\n```\n\nREPL output:\n{result_str}"
         return self._make_step_output([{"role": "user", "content": obs_text}], done=False)
+
+    def _finish(self, final_answer: str) -> BaseTextEnvStepOutput:
+        """Record the final answer, score it, and end the episode."""
+        self._final_answer = final_answer
+        self._reward = self._get_reward(final_answer)
+        return self._make_step_output([], done=True)
 
     def _make_step_output(self, observations: List[Dict[str, str]], done: bool) -> BaseTextEnvStepOutput:
         """Build a step output.

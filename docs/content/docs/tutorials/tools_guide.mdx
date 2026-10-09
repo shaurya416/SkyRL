@@ -27,7 +27,8 @@ import subprocess
 
 # Create a new tool group that inherits from ToolGroup
 class PythonCodeExecutorToolGroup(ToolGroup):
-    def __init__(self):
+    def __init__(self, timeout: float = 10.0):
+        self.timeout = timeout
         super().__init__(name="PythonCodeExecutorToolGroup")
 
     # Mark the python method as a tool
@@ -49,7 +50,7 @@ SkyRL-Gym provides pre-built ToolGroups that can be used out of the box in any S
 ### Python Code Execution
 
 ```python
-from skygym.tools import PythonCodeExecutorToolGroup
+from skyrl_gym.tools import PythonCodeExecutorToolGroup
 
 python_tools = PythonCodeExecutorToolGroup(timeout=15.0)
 result = python_tools.execute_tool("python", "print('Hello, World!')")
@@ -59,17 +60,18 @@ result = python_tools.execute_tool("python", "print('Hello, World!')")
 ### SQL Code Execution
 
 ```python
-from skygym.tools import SQLCodeExecutorToolGroup
+from skyrl_gym.tools import SQLCodeExecutorToolGroup
 
 sql_tools = SQLCodeExecutorToolGroup(db_file_path="/path/to/databases")
-result = sql_tools.execute_tool("sql", "SELECT * FROM users")
+# Arguments: database id (a directory under db_file_path holding <db_id>.sqlite), query, turns left
+result = sql_tools.execute_tool("sql", "my_db", "SELECT * FROM users", 5)
 
 ```
 
 ### Search ToolGroup
 
 ```python
-from skygym.tools import SearchToolGroup
+from skyrl_gym.tools import SearchToolGroup
 
 search_tools = SearchToolGroup(
     search_url="http://127.0.0.1:8000/retrieve"
@@ -89,7 +91,7 @@ The following sub-sections walk through integrating and using tools in an enviro
 To incorporate tools into an envrionment, first build and initialize the tool groups during environment construction:
 
 ```python
-from skygym.envs.base_text_env import BaseTextEnv
+from skyrl_gym.envs.base_text_env import BaseTextEnv
 
 class MyEnvironment(BaseTextEnv):
     def __init__(self, env_config, extras):
