@@ -92,8 +92,10 @@ This logic is largely copied from the Hendrycks' MATH release (math_equivalence)
 - https://github.com/openai/prm800k
 """
 
+import ast
 import contextlib
 import math
+import operator
 import re
 from math import isclose
 from typing import Union
@@ -165,11 +167,60 @@ def handle_pi(string, pi):
             # Find the next occurrence of "\pi"
             idx = string.find("\\pi", idx + 1)
 
-        # Evaluate the expression using eval() function
+        # Evaluate the arithmetic; the string is model output, so it never goes to eval()
         with contextlib.suppress(Exception):
-            string = eval(string)
+            string = eval_numeric_expression(string)
 
     return string
+
+
+_NUMERIC_BINARY_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_NUMERIC_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def eval_numeric_expression(expression: str):
+    """Evaluate a Python arithmetic expression over int/float literals, lists, tuples and sets.
+
+    Answers are model output: eval() would run any code in them, including code that
+    reads the reference answer from the caller's frame. Anything other than numbers,
+    + - * / // % ** and list/tuple/set displays raises ValueError. Operators apply to numbers
+    only, and powers are computed on floats, so a huge exponent overflows instead of
+    building an enormous integer.
+    """
+
+    def _number(node):
+        value = _eval(node)
+        if type(value) not in (int, float):
+            raise ValueError(f"not a number: {type(value).__name__}")
+        return value
+
+    def _eval(node):
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _NUMERIC_UNARY_OPS:
+            return _NUMERIC_UNARY_OPS[type(node.op)](_number(node.operand))
+        if isinstance(node, ast.BinOp) and type(node.op) in _NUMERIC_BINARY_OPS:
+            left, right = _number(node.left), _number(node.right)
+            if isinstance(node.op, ast.Pow):
+                left, right = float(left), float(right)
+            return _NUMERIC_BINARY_OPS[type(node.op)](left, right)
+        if isinstance(node, ast.List):
+            return [_eval(element) for element in node.elts]
+        if isinstance(node, ast.Tuple):
+            return tuple(_eval(element) for element in node.elts)
+        if isinstance(node, ast.Set):
+            return {_eval(element) for element in node.elts}
+        raise ValueError(f"not a numeric expression: {type(node).__name__}")
+
+    return _eval(ast.parse(expression.strip(), mode="eval").body)
 
 
 def math_equal(
@@ -297,9 +348,9 @@ def math_equal(
         except Exception:
             pass
     elif "\begin{pmatrix}" in reference and prediction.startswith("[") and prediction.endswith("]"):
-        if isinstance(eval(prediction), list):
+        if isinstance(eval_numeric_expression(prediction), list):
             try:
-                pred_matrix = eval(prediction)
+                pred_matrix = eval_numeric_expression(prediction)
                 # ref_matrix_items = reference.split()[1:-1:2]
                 ref_matrix_items = (
                     reference.lstrip("\\begin{pmatrix}")

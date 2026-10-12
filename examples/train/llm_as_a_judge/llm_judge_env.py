@@ -66,10 +66,11 @@ class GSM8kLLMJudgeEnv(BaseTextEnv):
             )
             reply = response.choices[0].message.content.strip()
 
-            # Try to parse score from "### Final Score: x"
-            match = re.search(r"### Final Score:\s*([01](?:\.0)?)", reply)
-            if match:
-                return float(match.group(1))
+            # Parse the score from the last "### Final Score: x": the verdict ends the reply, and an
+            # earlier one is the judge restating the rubric or quoting the predicted solution.
+            scores = re.findall(r"### Final Score:\s*([01](?:\.0)?)", reply)
+            if scores:
+                return float(scores[-1])
 
             # Fallback: raw "1" or "0"
             if reply.strip() in {"1", "0"}:
