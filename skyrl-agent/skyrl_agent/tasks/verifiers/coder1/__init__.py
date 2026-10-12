@@ -3,6 +3,7 @@ from typing import Tuple, Optional
 import time
 import json
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -28,6 +29,40 @@ else:
 
 CODE_PATTERN = re.compile(r"```(?:\w+)?\n(.*?)\n```", re.DOTALL)
 ANSWER_PATTERN = re.compile(r"</think>(.*)", re.DOTALL)
+# pytest's closing summary, e.g. "==== 3 passed, 1 warning in 0.12s ====". pytest prints it
+# as the last line, and only once the session has finished, so a run that the solution ends
+# early never shows it.
+PYTEST_SUMMARY_LINE = re.compile(r"^=*\s*(?P<counts>\d+ [a-z ]+(?:, \d+ [a-z ]+)*) in [0-9.]+s\b")
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+# Outcomes that are not a pass. The solution can produce "skipped" and "xfailed" itself by
+# calling pytest.skip() / pytest.xfail() from the code under test, which leaves the exit
+# status at 0 although the test did not pass.
+PYTEST_NOT_PASSED_OUTCOMES = frozenset({"failed", "error", "errors", "skipped", "xfailed"})
+
+
+def pytest_tests_passed(output: str) -> bool:
+    """True if pytest's closing summary reports passed tests and none failed, errored, skipped or xfailed."""
+    # Only the last line is the closing summary; earlier lines can carry text the solution
+    # controls, such as a warning message in the warnings summary.
+    lines = [line for line in ANSI_ESCAPE.sub("", output).splitlines() if line.strip()]
+    match = PYTEST_SUMMARY_LINE.match(lines[-1].strip()) if lines else None
+    if match is None:
+        return False
+    outcomes = set(re.findall(r"[a-z]+", match["counts"]))
+    return "passed" in outcomes and not outcomes & PYTEST_NOT_PASSED_OUTCOMES
+
+
+def append_completion_marker(test_code: str) -> Tuple[str, str]:
+    """Append a statement that prints a fresh marker after ``test_code`` has run.
+
+    A zero exit status alone does not show that the tests ran: the solution runs first
+    and can end the process early with status 0 (``sys.exit(0)``, ``os._exit(0)``,
+    ``exit()``). The marker is printed only if control reaches the end of the tests. It
+    is written straight to file descriptor 1 so that a solution rebinding ``print`` or
+    ``sys.stdout`` cannot hide it from a run that did complete.
+    """
+    marker = f"__coder1_tests_completed_{uuid.uuid4().hex}__"
+    return f"{test_code}\n__import__('os').write(1, b'\\n{marker}\\n')\n", marker
 
 
 def remote_check_stdio(code, stdin, stdout):
@@ -193,11 +228,18 @@ def _compute_score(solution_str, ground_truth, extra_info, format_reward=0.0, an
         if "functional" in ground_truth:
             if "prefix" in extra_info and extra_info["prefix"] != None:
                 solution_code = extra_info["prefix"] + "\n" + solution_code
-            succ, output = code_exec(solution_code + "\n" + ground_truth["functional"])
+            test_code, marker = append_completion_marker(ground_truth["functional"])
+            succ, output = code_exec(solution_code + "\n" + test_code)
+            # The solution runs before the tests, so exiting early also yields status 0, as
+            # does an exit handler that calls os._exit(0) after a failed assertion.
+            succ = succ and marker in output
         elif "solution_file" in ground_truth:
             succ, output = code_exec(solution_code, solution=ground_truth["solution_file"])
         else:  # pytest
             succ, output = code_exec(solution_code, pytest=ground_truth["pytest"])
+            # os._exit(0) or pytest.skip() while the tests import or call the solution also
+            # yields status 0, as does an exit handler that calls os._exit(0) after failures.
+            succ = succ and pytest_tests_passed(output)
         if not succ:
             # reward_log.append(
             #     "!" * 16

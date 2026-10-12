@@ -400,6 +400,13 @@ class PersistentREPL:
                 Each element overrides the child's REPL ``context`` variable
                 (e.g. a single paper string instead of the parent's full dict).
         """
+        # A length mismatch would silently drop prompts (their results stay "") or
+        # pair prompts with the wrong contexts; raising shows the error to the model.
+        if context_list is not None and len(context_list) != len(prompts):
+            raise ValueError(
+                f"rlm_query_batched: context_list has {len(context_list)} entries but prompts has "
+                f"{len(prompts)}; pass exactly one context per prompt."
+            )
         if self.subcall_fn is not None:
             contexts = context_list or [None] * len(prompts)
             if len(prompts) <= 1:
@@ -509,17 +516,19 @@ class PersistentREPL:
         record: Dict[str, Any] = {"final_answer": None}
         try:
             old_alarm = signal.signal(signal.SIGALRM, _raise_timeout)
-            signal.alarm(int(self.timeout))
+            # setitimer keeps fractional seconds; signal.alarm(int(timeout)) truncated
+            # them, so a sub-second timeout became alarm(0) and disabled the timeout.
+            signal.setitimer(signal.ITIMER_REAL, self.timeout)
             with _capture_output(stdout_buf, stderr_buf):
                 combined = self._begin_exec(record)
                 exec(code, combined, combined)
                 self._commit(combined)
         except TimeoutError:
-            error_str = f"Timeout after {int(self.timeout)} seconds\n"
+            error_str = f"Timeout after {self.timeout:g} seconds\n"
         except Exception:
             error_str = traceback.format_exc()
         finally:
-            signal.alarm(0)
+            signal.setitimer(signal.ITIMER_REAL, 0)
             if old_alarm is not None:
                 signal.signal(signal.SIGALRM, old_alarm)
             self._end_exec()
@@ -566,7 +575,7 @@ class PersistentREPL:
         with lock:
             if not result["finished"]:
                 result["abandoned"] = True
-                return f"Timeout after {int(self.timeout)} seconds\n", result["final_answer"]
+                return f"Timeout after {self.timeout:g} seconds\n", result["final_answer"]
         return result["error"], result["final_answer"]
 
     # ------------------------------------------------------------------

@@ -175,6 +175,33 @@ class TestRLMQuery:
         assert "ok:good" in result.stdout
         assert "ok:also_good" in result.stdout
 
+    def test_rlm_query_batched_passes_each_context_to_its_prompt(self):
+        def context_subcall(prompt, context=None):
+            return f"{prompt}:{context}"
+
+        repl = PersistentREPL(lm_callback=_mock_lm_callback, subcall_fn=context_subcall)
+        result = repl.execute("print(rlm_query_batched(['p0', 'p1', 'p2'], context_list=['c0', 'c1', 'c2']))")
+        assert result.stdout.strip() == "['p0:c0', 'p1:c1', 'p2:c2']"
+
+    def test_rlm_query_batched_rejects_context_list_length_mismatch(self):
+        """A mismatch is an error, not prompts silently left undispatched with "" results."""
+        calls = []
+
+        def recording_subcall(prompt, context=None):
+            calls.append(prompt)
+            return f"{prompt}:{context}"
+
+        repl = PersistentREPL(lm_callback=_mock_lm_callback, subcall_fn=recording_subcall)
+        for code in (
+            "results = rlm_query_batched(['p0', 'p1', 'p2'], context_list=['c0'])",
+            "results = rlm_query_batched(['p0', 'p1'], context_list=['c0', 'c1', 'c2'])",
+        ):
+            result = repl.execute(code)
+            assert "ValueError" in result.stderr
+            assert "context_list has" in result.stderr
+            assert "results" not in repl.locals
+        assert calls == []
+
     def test_rlm_query_error_handling(self):
         def bad_subcall(prompt, context=None):
             raise RuntimeError("subcall exploded")
@@ -366,7 +393,43 @@ class TestConcurrentREPLOutput:
 
 
 # ---------------------------------------------------------------------------
-# 5. Timed-out executions (thread fallback)
+# 5. Timeouts on the main thread (SIGALRM)
+# ---------------------------------------------------------------------------
+
+
+class TestMainThreadTimeout:
+    """pytest runs tests on the main thread, so these executions take the SIGALRM path."""
+
+    def _repl(self, timeout):
+        import time
+
+        return PersistentREPL(timeout=timeout, custom_tools={"sleep": time.sleep})
+
+    def test_sub_second_timeout_interrupts_execution(self):
+        import time
+
+        repl = self._repl(timeout=0.5)
+        start = time.monotonic()
+        result = repl.execute("sleep(3)\nx = 1")
+        assert time.monotonic() - start < 2
+        assert result.stderr == "Timeout after 0.5 seconds\n"
+        assert "x" not in repl.locals
+
+    def test_fractional_timeout_is_not_truncated(self):
+        # Truncated to 1 second, the timeout would fire during the sleep.
+        repl = self._repl(timeout=1.9)
+        result = repl.execute("sleep(1.2)\nx = 1")
+        assert result.stderr == ""
+        assert repl.locals["x"] == 1
+
+    def test_whole_second_timeout_message(self):
+        repl = self._repl(timeout=1)
+        result = repl.execute("sleep(3)")
+        assert result.stderr == "Timeout after 1 seconds\n"
+
+
+# ---------------------------------------------------------------------------
+# 6. Timed-out executions (thread fallback)
 # ---------------------------------------------------------------------------
 
 
